@@ -1,218 +1,92 @@
-Agent Rules (Authoritative)
+# AGENTS.md
 
-This file defines **non-negotiable rules** that all code generated or modified by agents must follow.
-If a rule here conflicts with any other document, this file wins.
+## Purpose
 
----
+This repo uses small, focused review agents. Each agent has a narrow scope and a consistent output format so reviews stay actionable and do not turn into debates.
 
-## Non-negotiable rules
+## How to use
 
-- No business logic in handlers.
-- No globals.
-- Services own orchestration and domain behavior.
-- Domain entities do not contain API input rules.
-- Stores return domain models, never persistence structs.
-- Internal errors are never exposed to clients.
-- All multi-write operations must be atomic.
+- Pick the smallest set of agents for the task.
+- Give each agent the same input (PR link, diff, file paths, or spec excerpt).
+- Ask for a short review using the agent’s output format.
+- If agents disagree, apply the conflict rules below.
 
----
+## Agent roster
 
-### Encapsulate domain state checks
+### 1) Testing Agent
 
-- Do not compare domain states directly in application or domain logic (e.g. status == Pending).
-- All checks with business meaning must be expressed as intent-revealing methods on the domain type (e.g. IsPending(), CanTransitionTo()).
+**Scope:** contracts and behavior verification.
 
-- Direct comparisons are only acceptable for:
+- Prefers contract-first integration tests over mocks.
+- Focuses on scenario coverage, determinism, and avoiding duplicate test layers.
+- Will only discuss architecture when it affects testability or behavioral contracts.
 
-  - serialization / persistence
-    +\* transport or wiring code
-  - test setup
+### 2) DDD Patterns Agent
 
-- If a conditional would need to change when the domain rule changes, it belongs behind a method.
+**Scope:** domain model clarity.
 
-## Module structure
+- Aggregates, invariants, value objects, domain primitives, transitions.
+- Boundary hygiene between transport, application, domain, persistence.
+- Avoids framework-specific styling unless it impacts domain integrity.
 
-### Handlers
+### 3) Performance Agent
 
-- Handle HTTP concerns only: parsing, request validation, response mapping.
-- Always accept and pass through `context.Context`.
+**Scope:** scalability and predictability under load.
 
-### Services
+- Measurement-first (p95, error rate, saturation), backpressure, timeouts, bounded retries.
+- DB access patterns, cache correctness, queue/stream throughput patterns.
+- Will not propose “speed” changes that weaken correctness or security.
 
-- All business logic lives in services.
-- Depend only on interfaces.
-- Validate domain invariants.
-- Perform orchestration and error mapping.
+### 4) Security Agent
 
-### Models
+**Scope:** concrete application security controls and misuse cases.
 
-- Domain models represent persisted state.
-- No API input rules on domain entities.
-- Request/command structs may contain `Validate()` methods.
+- AuthN/AuthZ checks, secret handling, dependency/config risks, logging safety.
+- Threat-focused review of endpoints, queues, caches, webhooks, uploads.
+- Suggests mitigations that fit the current design constraints.
 
-### Stores
+### 5) Secure-by-Design Review Agent
 
-- Interfaces only.
-- Must be swappable (in-memory, SQL, etc.).
-- Return domain models.
+**Scope:** architectural security via modeling and invariants.
 
----
+- Trust boundaries and boundary translations.
+- Domain primitives, constructors/factories, immutability, safe failure modeling.
+- Lifecycle safety (identity, tokens/sessions, consents/permissions) in generic terms.
+- Rejects patches that do not change unsafe structure.
 
-## Validation placement
+## Overlap boundaries (to prevent conflicts)
 
-### Domain invariants
+- **Security Agent** asks: “What can go wrong and what controls prevent it?”
+- **Secure-by-Design Agent** asks: “Is the design shaped so whole classes of bugs cannot exist?”
+- If both are used, Secure-by-Design sets the design constraints, Security proposes controls that fit them.
 
-- Rules that must _always_ hold for an entity.
-- Violations mean corrupted state.
-- Enforced via constructors or persistence boundaries.
+## Conflict resolution rules (tie-breakers)
 
-### API input rules
+1. **Correctness beats performance.**
+2. **Security beats convenience.**
+3. **Contracts beat implementation details.**
+4. If two agents disagree, prefer the smallest change that satisfies both.
+5. If a tradeoff is real, document it explicitly:
+   - what you gain
+   - what risk you accept
+   - how you will test or monitor it
 
-- Rules specific to an API, flow, or version.
-- May change without data migration.
-- Enforced on request/command structs or in services.
+## Default review order
 
-**Rule of thumb**  
-If a rule can change without invalidating stored data, it is an API input rule.
+1. Secure-by-Design (only if changing boundaries, auth, lifecycles, primitives)
+2. DDD (if changing domain logic or service boundaries)
+3. Testing (if changing behavior, contracts, or refactoring internals)
+4. Security (if changing exposed surfaces, auth, config, deps)
+5. Performance (if changing hot paths, concurrency, caching, DB access)
 
-Example:  
-A `Client` must always have a non-nil `TenantID` (domain invariant), but redirect URI scheme rules are API input rules.
+## Output expectations
 
----
+All agents should:
 
-## Entity state
+- Keep reviews short and ranked by impact.
+- Prefer refactors that simplify.
+- Provide “next step” changes you can do in one sitting.
 
-- Entity lifecycle state (e.g. Session status) must be modeled using
-  closed sets (typed constants or value objects), never magic strings
-  or booleans. State transitions are enforced in services or entities.
+## When to consolidate agents
 
-## Error handling
-
-- Use domain error codes via `pkg/domain-errors`.
-- Map store or infra errors to domain errors at the service boundary.
-- Never leak internal error details.
-
----
-
-## Transactions
-
-- Use `RunInTx` for multi-store writes.
-- Avoid partial persistence on failure.
-- Token, session, and audit updates must be atomic.
-
----
-
-## Testing (authoritative rules)
-
-Testing in Credo follows a **contract-first, behavior-driven approach**.
-
-### Sources of truth
-
-- Gherkin **feature files are the authoritative contracts**.
-- Cucumber tests that execute real components are considered **integration tests**.
-- Feature-driven integration tests define correctness.
-
----
-
-### Test layers and intent
-
-#### Feature-driven integration tests (primary)
-
-- Validate externally observable behavior.
-- Execute real system boundaries.
-- Must map directly to feature scenarios.
-- Define correctness for the system.
-
-If behavior matters to users or clients, it belongs here.
-
----
-
-#### Non-Cucumber integration tests (secondary)
-
-Allowed only when behavior:
-
-- cannot be expressed clearly in Gherkin, or
-- involves concurrency, shutdown, retries, timing, or partial failure.
-
-These tests must justify why they are not feature scenarios.
-
----
-
-#### Unit tests (tertiary, exceptional)
-
-Unit tests are **not required for all service logic**.
-
-They exist only to:
-
-- enforce invariants
-- validate edge cases unreachable via integration tests
-- assert error propagation or mapping across boundaries
-- test pure functions with meaningful logic
-
-Unit tests must **not**:
-
-- assert internal state or struct fields
-- encode call ordering or orchestration
-- duplicate feature or integration coverage
-
-Every unit test must answer:
-
-> âWhat invariant would break if this test were removed?â
-
----
-
-### Duplication policy
-
-- No behavior should be tested at multiple layers without justification.
-- Feature tests take precedence.
-- Lower-level tests that duplicate feature coverage are flagged for review, not deleted by default.
-
----
-
-### Mocks and doubles
-
-- Avoid mocks by default.
-- Use mocks only to induce failure modes or validate error propagation.
-- Stores, adapters, and transports must remain swappable.
-
----
-
-### Conservative posture
-
-- Tests are not deleted automatically.
-- First classify, then justify rewrite or removal.
-- Prefer rewriting tests toward contract assertions.
-
----
-
-### Additional conventions
-
-- see docs/conventions.md
-
-### Secure-by-Design Review Agent
-
-**Role**
-Review Credo architecture, code, and PRDs to ensure security emerges from design decisions and domain modeling, not from late-stage controls or defensive coding.
-
-**Core Principles Enforced**
-
-1. Security is driven by design and programming discipline
-2. Domain primitives enforce validity at creation time
-3. Immutability by default; partial immutability for entity identity
-4. Fail-fast contracts on all public APIs
-5. Strict, ordered input validation (Origin â Size â Lexical â Syntax â Semantics)
-6. Entity integrity enforced through constructors or builders, not setters
-7. Sensitive data modeled as read-once objects; no echoing of user input
-8. Expected business failures modeled as results, not exceptions
-9. Microservice APIs expose domain operations only
-10. Continuous change via Rotate, Repave, Repair
-
-**Primary Focus Areas**
-
-- Type systems, value objects, and domain primitives
-- Constructors, factories, and builders
-- Trust boundaries and boundary translations
-- Token, consent, and identity lifecycles
-- Authority propagation across modules
-- Error and failure modeling
-- Test intent (security behavior vs implementation details
+If you repeatedly run both Security and Secure-by-Design and they duplicate work, remove Security and keep Secure-by-Design only.
