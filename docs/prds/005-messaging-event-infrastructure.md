@@ -91,13 +91,35 @@ The messaging infrastructure solves these problems with reliable, auditable, and
 
 ## Technical Requirements
 
-### TR-1: RabbitMQ Configuration
+### TR-1: Architecture Constraints
+
+Per AGENTS.md, the messaging infrastructure must support the following patterns:
+
+**Outbox Pattern (Publishers)**
+- Events inserted in same transaction as business state change
+- Background worker publishes events asynchronously
+- Ensures exactly-once semantics for event creation (linked to transaction commit)
+- At-least-once delivery to message broker
+
+**Consumer Architecture**
+- Consumers follow handler/service/store pattern
+- Message handler: deserialize, validate, route to service
+- Service: business logic, state changes, idempotency checks
+- Store: persistence, consumed_events tracking
+- All multi-write operations must be atomic (per AGENTS.md)
+
+**Idempotency**
+- All consumers must be idempotent (at-least-once delivery)
+- Deduplication via consumed_events table
+- Business logic and dedup insert in same transaction
+
+### TR-2: RabbitMQ Configuration
 - RabbitMQ 3.x with management plugin
 - Virtual host: / (default)
 - User: ticketing (configurable credentials)
 - Management UI on port 15672
 
-### TR-2: Exchange Configuration
+### TR-3: Exchange Configuration
 ```
 Exchange: ticketing.events
 Type: topic
@@ -105,7 +127,7 @@ Durable: true
 Auto-delete: false
 ```
 
-### TR-3: Queue Configuration
+### TR-4: Queue Configuration
 ```
 Queue: inventory.events
 Durable: true
@@ -117,7 +139,7 @@ Bindings:
   - routing_key: order.confirmed
 ```
 
-### TR-4: Dead Letter Exchange
+### TR-5: Dead Letter Exchange
 ```
 Exchange: ticketing.dlx
 Type: direct
@@ -128,7 +150,7 @@ Durable: true
 Binding: inventory.events.dlq
 ```
 
-### TR-5: Outbox Table Schema
+### TR-6: Outbox Table Schema
 
 | Field | Type | Constraints |
 |-------|------|-------------|
@@ -142,7 +164,7 @@ Binding: inventory.events.dlq
 
 Index: (published, created_at) for publisher polling
 
-### TR-6: Consumed Events Table
+### TR-7: Consumed Events Table
 
 | Field | Type | Constraints |
 |-------|------|-------------|
@@ -150,17 +172,34 @@ Index: (published, created_at) for publisher polling
 | event_type | String | Not Null |
 | consumed_at | Timestamp | Not Null |
 
-### TR-7: Outbox Publisher Worker
+### TR-8: Outbox Publisher Worker
 - Celery task running every 5 seconds
 - Batch size: 100 events per poll
 - Publish message, then mark as published
 - Handle RabbitMQ connection failures with retry
 
-### TR-8: Consumer Implementation
+### TR-9: Consumer Implementation
 - Async consumer using aio-pika (FastAPI) or pika (Django)
 - Prefetch count: 10 (configurable)
 - Manual ack mode
 - Graceful shutdown with in-flight message completion
+
+### TR-10: Error Handling
+
+Per AGENTS.md:
+- Consumer errors mapped to domain errors at service boundary
+- Never leak internal error details in logs exposed externally
+- Expected failures (validation errors, business rule violations) logged and sent to DLQ
+- Transient failures (connection issues, timeouts) retried with backoff
+- Permanent failures logged with full context for debugging
+
+**Error Categories**
+| Category | Action | Example |
+|----------|--------|---------|
+| Transient | Retry with backoff | RabbitMQ connection timeout |
+| Validation | DLQ immediately | Malformed event payload |
+| Business | DLQ after logging | Invalid state transition |
+| Infrastructure | Alert + retry | Database unavailable |
 
 ## Non-Functional Requirements
 
@@ -189,6 +228,18 @@ Index: (published, created_at) for publisher polling
 - DLQ messages inspectable via management UI
 - Manual message replay capability
 - Queue purge capability (with confirmation)
+
+### NFR-6: Security (Secure-by-Design)
+
+Per AGENTS.md secure-by-design principles:
+
+- RabbitMQ credentials never hardcoded (environment variables)
+- Message payloads validated at consumer boundary before processing
+- Sensitive data (customer_email) redacted in logs
+- Event payloads do not contain raw user input without sanitization
+- Consumer services validate event schema strictly (fail-fast)
+- DLQ messages may contain sensitive data - access restricted
+- Correlation IDs for tracing do not contain sensitive information
 
 ## Event Message Format
 
@@ -229,6 +280,55 @@ headers:
 - PostgreSQL (for outbox and consumed_events tables)
 - Celery (for outbox publisher worker)
 - Redis (for Celery broker)
+
+## Testing Approach
+
+Per AGENTS.md testing guidelines, this infrastructure component follows contract-first, behavior-driven testing:
+
+### Feature-Driven Integration Tests (Primary)
+- Gherkin feature files define the authoritative contract
+- Scenarios cover: event publishing, consumption, idempotency, DLQ routing
+- Execute against real RabbitMQ instance
+
+### Example Scenarios
+```gherkin
+Feature: Event Publishing and Consumption
+  Scenario: Publish event via outbox pattern
+    Given an order is confirmed in the database
+    And an outbox event is created in the same transaction
+    When the outbox publisher runs
+    Then the event is published to RabbitMQ
+    And the outbox event is marked as published
+
+  Scenario: Consumer idempotency
+    Given an event with id "event-123" was previously processed
+    When the same event is received again
+    Then the event is acknowledged without processing
+    And no duplicate business action occurs
+
+  Scenario: Failed message routing to DLQ
+    Given a consumer that fails to process a message
+    When the message has been retried 3 times
+    Then the message is routed to the dead letter queue
+    And an alert is raised
+
+  Scenario: System recovery after RabbitMQ restart
+    Given events are queued in RabbitMQ
+    When RabbitMQ restarts
+    Then queued messages are preserved
+    And consumers resume processing
+```
+
+### Non-Cucumber Integration Tests
+- Connection failure and reconnection behavior
+- Concurrent consumer processing
+- Outbox publisher under load
+- Message ordering guarantees (or lack thereof)
+
+### Unit Tests (Exceptional)
+- Event envelope serialization/deserialization
+- Retry count calculation and backoff timing
+- Must justify: "What invariant would break if removed?"
 
 ## Acceptance Criteria
 

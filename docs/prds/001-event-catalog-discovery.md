@@ -63,34 +63,74 @@ Customers need an intuitive, fast, and reliable way to discover events, view ava
 
 ## Technical Requirements
 
-### TR-1: API Layer
+### TR-1: Architecture Constraints
+
+Per AGENTS.md, the implementation must follow these patterns:
+
+**Handler Layer (Views)**
+- Handle HTTP concerns only: request parsing, validation, response mapping
+- No business logic in handlers
+- Accept and pass through request context
+- Map domain errors to appropriate HTTP status codes
+- Never expose internal error details to clients
+
+**Service Layer**
+- All business logic lives in services
+- Depend only on interfaces (stores, external services)
+- Validate domain invariants
+- Perform orchestration and error mapping
+- Return domain models or domain errors
+
+**Store Layer**
+- Interfaces only (repository pattern)
+- Must be swappable (in-memory for tests, PostgreSQL for production)
+- Return domain models, never persistence structs
+- Handle database-specific concerns internally
+
+### TR-2: API Layer
 - REST API built with Django REST Framework (DRF)
 - JSON response format
 - Consistent error response structure with appropriate HTTP status codes
 - API versioning support for future compatibility
+- Domain errors mapped to HTTP responses at handler boundary
 
-### TR-2: Caching Strategy
+### TR-3: Caching Strategy
 - Redis caching layer for all read endpoints
 - Event list cache with 5-minute TTL
 - Event detail cache with 5-minute TTL
 - Session list cache with 5-minute TTL
 - Cache key patterns: `events:list`, `events:{id}`, `events:{id}:sessions`
 
-### TR-3: Cache Invalidation
+### TR-4: Cache Invalidation
 - Django signals shall trigger cache invalidation on model save/delete
 - Use `cache.delete_pattern()` for invalidating related cache keys
 - Admin saves shall immediately invalidate relevant caches
 
-### TR-4: Database Design
+### TR-5: Database Design
 - PostgreSQL database (`ticketing_main`)
 - UUID primary keys for all entities
 - Proper foreign key relationships with cascading deletes
 - Indexed fields for query performance
 
-### TR-5: Data Models
-- Event: id, name, description, location, image_url, created_at, updated_at
-- Session: id, event_id (FK), starts_at, ends_at, total_capacity, created_at
-- TicketType: id, session_id (FK), name, price, quantity, created_at
+### TR-6: Domain Models
+
+Domain models represent persisted state with no API input rules:
+
+- **Event**: id, name, description, location, image_url, created_at, updated_at
+- **Session**: id, event_id (FK), starts_at, ends_at, total_capacity, created_at
+- **TicketType**: id, session_id (FK), name, price, quantity, created_at
+
+Domain primitives should be used for:
+- **EventId, SessionId, TicketTypeId**: UUID value objects
+- **Money**: Price representation with currency handling
+- **Capacity**: Non-negative integer with validation at construction
+
+### TR-7: Error Handling
+- Use domain error codes for all error responses
+- Map store/infrastructure errors to domain errors at service boundary
+- Never leak internal error details (stack traces, SQL errors) to clients
+- Error responses must include: error_code, user-safe message
+- Log internal details for debugging while returning safe client responses
 
 ## Non-Functional Requirements
 
@@ -107,10 +147,17 @@ Customers need an intuitive, fast, and reliable way to discover events, view ava
 - Stateless API design to support horizontal scaling
 - Cache layer designed for distributed deployment
 
-### NFR-4: Security
+### NFR-4: Security (Secure-by-Design)
+
+Per AGENTS.md secure-by-design principles:
+
 - Read endpoints are public (no authentication required)
 - Admin endpoints protected by Django authentication
-- Input validation on all parameters
+- Strict input validation order: Origin → Size → Lexical → Syntax → Semantics
+- Domain primitives enforce validity at creation time (e.g., EventId, Money)
+- No echoing of raw user input in responses
+- Request structs contain validation; domain entities do not contain API rules
+- Fail-fast on invalid input at API boundary
 
 ## API Specification
 
@@ -176,6 +223,36 @@ Customers need an intuitive, fast, and reliable way to discover events, view ava
 - PostgreSQL 16+ for data persistence
 - Redis 7+ for caching layer
 - Django 4.x with Django REST Framework
+
+## Testing Approach
+
+Per AGENTS.md testing guidelines, this component follows contract-first, behavior-driven testing:
+
+### Feature-Driven Integration Tests (Primary)
+- Gherkin feature files define the authoritative contract
+- Scenarios cover: event listing, event details, session retrieval, cache behavior
+- Execute against real components (database, cache)
+
+### Example Scenarios
+```gherkin
+Feature: Event Catalog
+  Scenario: List all events
+    Given events exist in the catalog
+    When a customer requests the event list
+    Then they receive a paginated list of events
+
+  Scenario: Cached response
+    Given an event exists in the catalog
+    And the event has been requested recently
+    When a customer requests the event details
+    Then they receive a cached response
+    And the database is not queried
+```
+
+### Unit Tests (Exceptional)
+- Only for domain primitives (Money, Capacity validation)
+- Not required for service orchestration logic
+- Must justify: "What invariant would break if removed?"
 
 ## Acceptance Criteria
 
