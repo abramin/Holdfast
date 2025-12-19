@@ -7,15 +7,16 @@ Review architecture, code, and technical docs to ensure security emerges from de
 ## Core principles enforced
 
 1. Security is driven by design and programming discipline.
-2. Domain primitives enforce validity at creation time.
-3. Immutability by default; partial immutability for entity identity.
-4. Fail-fast contracts on all public APIs.
-5. Strict ordered input validation: Origin -> Size -> Lexical -> Syntax -> Semantics.
-6. Entity integrity enforced through constructors/factories/builders, not setters.
-7. Sensitive data modeled explicitly; avoid echoing user input; minimize secret exposure in logs/errors.
-8. Expected business failures modeled as results (typed outcomes), not exceptions.
-9. Service APIs expose domain operations only (avoid CRUD that leaks storage shape).
-10. Continuous change posture: Rotate, Repave, Repair (credentials, hosts, configs, dependencies).
+2. Domain primitives enforce validity at creation time AND at deserialization boundaries (json.Unmarshaler, sql.Scanner).
+3. Avoid panic-based APIs (MustX) in production code; restrict to test-only packages if needed.
+4. Immutability by default; partial immutability for entity identity.
+5. Fail-fast contracts on all public APIs.
+6. Strict ordered input validation: Origin -> Size -> Lexical -> Syntax -> Semantics.
+7. Entity integrity enforced through constructors/factories/builders, not setters.
+8. Sensitive data modeled explicitly; avoid echoing user input; minimize secret exposure in logs/errors.
+9. Expected business failures modeled as results (typed outcomes), not exceptions.
+10. Service APIs expose domain operations only (avoid CRUD that leaks storage shape).
+11. Continuous change posture: Rotate, Repave, Repair (credentials, hosts, configs, dependencies).
 
 ## Primary focus areas
 
