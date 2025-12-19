@@ -1,0 +1,218 @@
+Agent Rules (Authoritative)
+
+This file defines **non-negotiable rules** that all code generated or modified by agents must follow.
+If a rule here conflicts with any other document, this file wins.
+
+---
+
+## Non-negotiable rules
+
+- No business logic in handlers.
+- No globals.
+- Services own orchestration and domain behavior.
+- Domain entities do not contain API input rules.
+- Stores return domain models, never persistence structs.
+- Internal errors are never exposed to clients.
+- All multi-write operations must be atomic.
+
+---
+
+### Encapsulate domain state checks
+
+- Do not compare domain states directly in application or domain logic (e.g. status == Pending).
+- All checks with business meaning must be expressed as intent-revealing methods on the domain type (e.g. IsPending(), CanTransitionTo()).
+
+- Direct comparisons are only acceptable for:
+
+  - serialization / persistence
+    +\* transport or wiring code
+  - test setup
+
+- If a conditional would need to change when the domain rule changes, it belongs behind a method.
+
+## Module structure
+
+### Handlers
+
+- Handle HTTP concerns only: parsing, request validation, response mapping.
+- Always accept and pass through `context.Context`.
+
+### Services
+
+- All business logic lives in services.
+- Depend only on interfaces.
+- Validate domain invariants.
+- Perform orchestration and error mapping.
+
+### Models
+
+- Domain models represent persisted state.
+- No API input rules on domain entities.
+- Request/command structs may contain `Validate()` methods.
+
+### Stores
+
+- Interfaces only.
+- Must be swappable (in-memory, SQL, etc.).
+- Return domain models.
+
+---
+
+## Validation placement
+
+### Domain invariants
+
+- Rules that must _always_ hold for an entity.
+- Violations mean corrupted state.
+- Enforced via constructors or persistence boundaries.
+
+### API input rules
+
+- Rules specific to an API, flow, or version.
+- May change without data migration.
+- Enforced on request/command structs or in services.
+
+**Rule of thumb**  
+If a rule can change without invalidating stored data, it is an API input rule.
+
+Example:  
+A `Client` must always have a non-nil `TenantID` (domain invariant), but redirect URI scheme rules are API input rules.
+
+---
+
+## Entity state
+
+- Entity lifecycle state (e.g. Session status) must be modeled using
+  closed sets (typed constants or value objects), never magic strings
+  or booleans. State transitions are enforced in services or entities.
+
+## Error handling
+
+- Use domain error codes via `pkg/domain-errors`.
+- Map store or infra errors to domain errors at the service boundary.
+- Never leak internal error details.
+
+---
+
+## Transactions
+
+- Use `RunInTx` for multi-store writes.
+- Avoid partial persistence on failure.
+- Token, session, and audit updates must be atomic.
+
+---
+
+## Testing (authoritative rules)
+
+Testing in Credo follows a **contract-first, behavior-driven approach**.
+
+### Sources of truth
+
+- Gherkin **feature files are the authoritative contracts**.
+- Cucumber tests that execute real components are considered **integration tests**.
+- Feature-driven integration tests define correctness.
+
+---
+
+### Test layers and intent
+
+#### Feature-driven integration tests (primary)
+
+- Validate externally observable behavior.
+- Execute real system boundaries.
+- Must map directly to feature scenarios.
+- Define correctness for the system.
+
+If behavior matters to users or clients, it belongs here.
+
+---
+
+#### Non-Cucumber integration tests (secondary)
+
+Allowed only when behavior:
+
+- cannot be expressed clearly in Gherkin, or
+- involves concurrency, shutdown, retries, timing, or partial failure.
+
+These tests must justify why they are not feature scenarios.
+
+---
+
+#### Unit tests (tertiary, exceptional)
+
+Unit tests are **not required for all service logic**.
+
+They exist only to:
+
+- enforce invariants
+- validate edge cases unreachable via integration tests
+- assert error propagation or mapping across boundaries
+- test pure functions with meaningful logic
+
+Unit tests must **not**:
+
+- assert internal state or struct fields
+- encode call ordering or orchestration
+- duplicate feature or integration coverage
+
+Every unit test must answer:
+
+> âWhat invariant would break if this test were removed?â
+
+---
+
+### Duplication policy
+
+- No behavior should be tested at multiple layers without justification.
+- Feature tests take precedence.
+- Lower-level tests that duplicate feature coverage are flagged for review, not deleted by default.
+
+---
+
+### Mocks and doubles
+
+- Avoid mocks by default.
+- Use mocks only to induce failure modes or validate error propagation.
+- Stores, adapters, and transports must remain swappable.
+
+---
+
+### Conservative posture
+
+- Tests are not deleted automatically.
+- First classify, then justify rewrite or removal.
+- Prefer rewriting tests toward contract assertions.
+
+---
+
+### Additional conventions
+
+- see docs/conventions.md
+
+### Secure-by-Design Review Agent
+
+**Role**
+Review Credo architecture, code, and PRDs to ensure security emerges from design decisions and domain modeling, not from late-stage controls or defensive coding.
+
+**Core Principles Enforced**
+
+1. Security is driven by design and programming discipline
+2. Domain primitives enforce validity at creation time
+3. Immutability by default; partial immutability for entity identity
+4. Fail-fast contracts on all public APIs
+5. Strict, ordered input validation (Origin â Size â Lexical â Syntax â Semantics)
+6. Entity integrity enforced through constructors or builders, not setters
+7. Sensitive data modeled as read-once objects; no echoing of user input
+8. Expected business failures modeled as results, not exceptions
+9. Microservice APIs expose domain operations only
+10. Continuous change via Rotate, Repave, Repair
+
+**Primary Focus Areas**
+
+- Type systems, value objects, and domain primitives
+- Constructors, factories, and builders
+- Trust boundaries and boundary translations
+- Token, consent, and identity lifecycles
+- Authority propagation across modules
+- Error and failure modeling
+- Test intent (security behavior vs implementation details
