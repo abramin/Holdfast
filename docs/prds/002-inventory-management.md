@@ -73,22 +73,68 @@ Without a dedicated, optimized inventory service, the system risks overselling t
 
 ## Technical Requirements
 
-### TR-1: Framework & Language
+### TR-1: Architecture Constraints
+
+Per AGENTS.md, the implementation must follow these patterns:
+
+**Handler Layer (Routes)**
+- Handle HTTP concerns only: request parsing, validation, response mapping
+- No business logic in route handlers
+- Accept and pass through request context
+- Map domain errors to appropriate HTTP status codes
+- Never expose internal error details to clients
+
+**Service Layer**
+- All business logic lives in services
+- Depend only on interfaces (stores, message consumers)
+- Validate domain invariants (e.g., quantity > 0, valid state transitions)
+- Perform orchestration and error mapping
+- Return domain models or domain errors
+
+**Store Layer**
+- Interfaces only (repository pattern)
+- Must be swappable (in-memory for tests, PostgreSQL for production)
+- Return domain models, never SQLAlchemy/ORM objects directly
+- Handle SELECT FOR UPDATE and transaction concerns internally
+
+### TR-2: Framework & Language
 - FastAPI framework for high-performance async operations
 - Python 3.11+ with async/await patterns
 - Pydantic for request/response validation
 
-### TR-2: Database Design
+### TR-3: Database Design
 - PostgreSQL database (`ticketing_inventory`)
 - Separate database from Django monolith (data isolation)
 - UUID references to Django entities (session_id, ticket_type_id)
 
-### TR-3: Concurrency Control
+### TR-4: Concurrency Control
 - `SELECT FOR UPDATE` on InventoryItem during hold/release/commit
 - Row-level locking to prevent race conditions
 - Transaction isolation level: READ COMMITTED
+- All multi-write operations must be atomic (per AGENTS.md)
 
-### TR-4: Data Models
+### TR-5: Domain Models & State
+
+Per AGENTS.md, entity lifecycle state must use closed sets (typed constants), never magic strings.
+
+**HoldStatus (Value Object)**
+```python
+class HoldStatus(Enum):
+    HELD = "held"
+    RELEASED = "released"
+    COMMITTED = "committed"
+```
+
+**Domain State Checks**
+Do not compare status directly. Use intent-revealing methods:
+```python
+class InventoryHold:
+    def is_held(self) -> bool: ...
+    def is_released(self) -> bool: ...
+    def is_committed(self) -> bool: ...
+    def can_release(self) -> bool: ...
+    def can_commit(self) -> bool: ...
+```
 
 **InventoryItem**
 | Field | Type | Constraints |
@@ -109,22 +155,29 @@ Index: UNIQUE(session_id, ticket_type_id)
 | id | UUID | Primary Key (matches Django Hold.id) |
 | inventory_item_id | UUID | Foreign Key |
 | quantity | Integer | Not Null |
-| status | String | Enum: held, released, committed |
+| status | HoldStatus | Typed enum, not string |
 | expires_at | Timestamp | Not Null |
 | created_at | Timestamp | Not Null |
 | updated_at | Timestamp | Not Null |
 
 Index: (expires_at, status) for expiry queries
 
-### TR-5: Message Consumption
+### TR-6: Message Consumption
 - RabbitMQ consumer for `hold.expired` and `order.confirmed` events
 - Consumer deduplication table: consumed_events(event_id UNIQUE, consumed_at)
 - At-least-once delivery with idempotent processing
 
-### TR-6: Idempotency
+### TR-7: Idempotency
 - Hold operations idempotent by hold_id
 - If hold_id exists with status=held, return success without modification
 - If hold_id exists with status=released/committed, return appropriate response
+
+### TR-8: Error Handling
+Per AGENTS.md:
+- Use domain error codes (e.g., INSUFFICIENT_INVENTORY, HOLD_NOT_FOUND, INVALID_STATE_TRANSITION)
+- Map store/infrastructure errors to domain errors at service boundary
+- Never leak internal error details (SQL errors, stack traces) to clients
+- Expected business failures (insufficient inventory) modeled as results, not exceptions
 
 ## Non-Functional Requirements
 
@@ -145,6 +198,17 @@ Index: (expires_at, status) for expiry queries
 ### NFR-4: Durability
 - All inventory changes persisted before acknowledgment
 - No data loss during service restarts
+
+### NFR-5: Security (Secure-by-Design)
+
+Per AGENTS.md secure-by-design principles:
+
+- Internal service API (not public-facing) - called only by Django API
+- Domain primitives enforce validity at creation (HoldId, Quantity, SessionId)
+- Strict input validation order: Origin → Size → Lexical → Syntax → Semantics
+- Quantity validated as positive integer via domain primitive
+- UUIDs validated at API boundary before domain operations
+- No sensitive data exposure in error responses
 
 ## API Specification
 
@@ -215,6 +279,48 @@ Response (200):
 - RabbitMQ 3.x for event consumption
 - Django Monolith (source of session/ticket type definitions)
 - Orders Service (source of order.confirmed events)
+
+## Testing Approach
+
+Per AGENTS.md testing guidelines, this component follows contract-first, behavior-driven testing:
+
+### Feature-Driven Integration Tests (Primary)
+- Gherkin feature files define the authoritative contract
+- Scenarios cover: hold creation, release, commit, concurrent access, event consumption
+- Execute against real database with SELECT FOR UPDATE behavior
+
+### Example Scenarios
+```gherkin
+Feature: Inventory Hold Management
+  Scenario: Create hold with available inventory
+    Given 100 tickets are available for session "concert-123"
+    When a hold is requested for 2 tickets
+    Then the hold is created successfully
+    And 98 tickets remain available
+
+  Scenario: Concurrent holds do not oversell
+    Given 10 tickets are available for session "concert-123"
+    When 20 concurrent requests each try to hold 1 ticket
+    Then exactly 10 holds succeed
+    And exactly 10 holds fail with insufficient inventory
+    And 0 tickets remain available
+
+  Scenario: Idempotent hold creation
+    Given a hold exists for hold_id "abc-123"
+    When a duplicate hold request is made for hold_id "abc-123"
+    Then the request succeeds
+    And no additional inventory is reserved
+```
+
+### Non-Cucumber Integration Tests
+- Concurrency and race condition testing (cannot express in Gherkin)
+- Connection failure and retry behavior
+- Transaction rollback scenarios
+
+### Unit Tests (Exceptional)
+- HoldStatus state transition validation
+- Quantity domain primitive validation
+- Must justify: "What invariant would break if removed?"
 
 ## Acceptance Criteria
 

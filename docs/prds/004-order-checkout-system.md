@@ -84,21 +84,75 @@ After customers hold tickets, they need to complete a purchase through a reliabl
 
 ## Technical Requirements
 
-### TR-1: Service Framework
+### TR-1: Architecture Constraints
+
+Per AGENTS.md, the implementation must follow these patterns:
+
+**Handler Layer (Routes)**
+- Handle HTTP concerns only: request parsing, validation, response mapping
+- No business logic in route handlers
+- Accept and pass through request context
+- Map domain errors to appropriate HTTP status codes
+- Never expose internal error details to clients
+
+**Service Layer**
+- All business logic lives in services (OrderService, PaymentService)
+- Depend only on interfaces (OrderStore, PaymentProvider)
+- Validate domain invariants and enforce state machine rules
+- Orchestrate order creation, confirmation, cancellation
+- Return domain models or domain errors
+
+**Store Layer**
+- Interfaces only (repository pattern)
+- Must be swappable (in-memory for tests, PostgreSQL for production)
+- Return domain models, never ORM objects directly
+- Handle OutboxEvent insertion atomically with order state changes
+
+### TR-2: Service Framework
 - FastAPI or Django REST Framework (separate service)
 - Separate database for order data isolation
 - REST API with JSON payloads
 
-### TR-2: Data Models
+### TR-3: Domain Models & State
+
+Per AGENTS.md, entity lifecycle state must use closed sets (typed constants), never magic strings.
+
+**OrderStatus (Value Object)**
+```python
+class OrderStatus(Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+```
+
+**PaymentStatus (Value Object)**
+```python
+class PaymentStatus(Enum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+```
+
+**Domain State Checks**
+Do not compare status directly in application logic. Use intent-revealing methods:
+```python
+class Order:
+    def is_pending(self) -> bool: ...
+    def is_confirmed(self) -> bool: ...
+    def is_cancelled(self) -> bool: ...
+    def can_confirm(self) -> bool: ...  # pending only
+    def can_cancel(self) -> bool: ...   # pending only
+    def is_terminal(self) -> bool: ...  # confirmed or cancelled
+```
 
 **Order**
 | Field | Type | Constraints |
 |-------|------|-------------|
 | id | UUID | Primary Key |
-| customer_email | String | Not Null |
-| status | String | Enum: pending, confirmed, cancelled |
-| total_amount | Decimal | Not Null |
-| idempotency_key | String | Unique, Indexed |
+| customer_email | EmailAddress | Domain primitive, validated |
+| status | OrderStatus | Typed enum, not string |
+| total_amount | Money | Domain primitive |
+| idempotency_key | IdempotencyKey | Unique, Indexed |
 | created_at | Timestamp | Not Null |
 | updated_at | Timestamp | Not Null |
 
@@ -109,8 +163,8 @@ After customers hold tickets, they need to complete a purchase through a reliabl
 | order_id | UUID | Foreign Key |
 | session_id | UUID | Not Null |
 | ticket_type_id | UUID | Not Null |
-| quantity | Integer | Not Null |
-| unit_price | Decimal | Not Null |
+| quantity | Quantity | Domain primitive, > 0 |
+| unit_price | Money | Domain primitive |
 | created_at | Timestamp | Not Null |
 
 **Payment**
@@ -118,8 +172,8 @@ After customers hold tickets, they need to complete a purchase through a reliabl
 |-------|------|-------------|
 | id | UUID | Primary Key |
 | order_id | UUID | Foreign Key, Unique |
-| amount | Decimal | Not Null |
-| status | String | Enum: pending, succeeded, failed |
+| amount | Money | Domain primitive |
+| status | PaymentStatus | Typed enum, not string |
 | payment_method | String | Default: "card_stub" |
 | created_at | Timestamp | Not Null |
 | updated_at | Timestamp | Not Null |
@@ -137,23 +191,46 @@ After customers hold tickets, they need to complete a purchase through a reliabl
 
 Index: (published, created_at) for publisher queries
 
-### TR-3: Idempotency Implementation
+### TR-4: Idempotency Implementation
 - Extract Idempotency-Key from request header
 - Check if order exists with matching key
 - If exists, return existing order (don't create duplicate)
 - If not exists, create order with key stored
 
-### TR-4: Outbox Publisher
+### TR-5: Outbox Publisher
 - Celery worker polls outbox every 5 seconds
 - Query: SELECT * FROM outbox WHERE published=false ORDER BY created_at LIMIT 100
 - Publish to RabbitMQ and mark published=true
 - Transaction: publish, then mark (at-least-once delivery)
 
-### TR-5: Django Proxy
+### TR-6: Django Proxy
 - Django /api/checkout endpoint proxies to Orders service
 - Django /api/orders/{id} endpoint proxies to Orders service
 - Django adds Idempotency-Key header from client or generates one
 - Handle Orders service errors gracefully
+
+### TR-7: Transaction Atomicity
+Per AGENTS.md, all multi-write operations must be atomic:
+- Order creation + OutboxEvent insert in same transaction
+- Order confirmation + Payment update + OutboxEvent in same transaction
+- Order cancellation + OutboxEvent in same transaction
+- Use RunInTx pattern for multi-store writes
+
+### TR-8: Error Handling
+
+Per AGENTS.md:
+- Use domain error codes (e.g., ORDER_NOT_FOUND, INVALID_STATE_TRANSITION, PAYMENT_FAILED)
+- Map store/infrastructure errors to domain errors at service boundary
+- Never leak internal error details to clients
+- Expected business failures (cannot cancel confirmed order) modeled as results, not exceptions
+
+**Error Response Mapping**
+| Domain Error | HTTP Status | Client Message |
+|--------------|-------------|----------------|
+| ORDER_NOT_FOUND | 404 | Order not found |
+| INVALID_STATE_TRANSITION | 400 | Cannot perform action on order in current state |
+| PAYMENT_FAILED | 402 | Payment could not be processed |
+| DUPLICATE_IDEMPOTENCY_KEY | 200 | Order already exists (return existing) |
 
 ## Non-Functional Requirements
 
@@ -176,6 +253,18 @@ Index: (published, created_at) for publisher queries
 - All order data persisted to PostgreSQL
 - No data loss on service restart
 - Outbox events survive service failures
+
+### NFR-5: Security (Secure-by-Design)
+
+Per AGENTS.md secure-by-design principles:
+
+- Internal service API (called by Django proxy, not directly by clients)
+- Domain primitives enforce validity at creation (EmailAddress, Money, Quantity)
+- Strict input validation order: Origin → Size → Lexical → Syntax → Semantics
+- IdempotencyKey validated and sanitized at boundary
+- Customer email treated as sensitive data (not logged in full)
+- Payment information never stored beyond stub (future: PCI compliance)
+- No echoing of raw user input in responses
 
 ## API Specification
 
@@ -313,6 +402,54 @@ Response (400):
 - Celery + Redis for outbox publisher
 - Django Monolith (API gateway/proxy)
 - Inventory Service (consumes order.confirmed)
+
+## Testing Approach
+
+Per AGENTS.md testing guidelines, this component follows contract-first, behavior-driven testing:
+
+### Feature-Driven Integration Tests (Primary)
+- Gherkin feature files define the authoritative contract
+- Scenarios cover: order creation, confirmation, cancellation, idempotency, state transitions
+- Execute against real database with transaction behavior
+
+### Example Scenarios
+```gherkin
+Feature: Order Management
+  Scenario: Create order with idempotency
+    Given a valid hold exists for customer "user@example.com"
+    When an order is created with idempotency key "key-123"
+    Then the order is created with status "pending"
+
+  Scenario: Duplicate idempotency key returns existing order
+    Given an order exists with idempotency key "key-123"
+    When another order is created with idempotency key "key-123"
+    Then the existing order is returned
+    And no new order is created
+
+  Scenario: Confirm pending order
+    Given a pending order exists
+    When the order is confirmed
+    Then the order status is "confirmed"
+    And a payment record is created with status "succeeded"
+    And an order.confirmed event is published
+
+  Scenario: Cannot cancel confirmed order
+    Given a confirmed order exists
+    When a cancellation is attempted
+    Then the request fails with "invalid_state"
+    And the order remains confirmed
+```
+
+### Non-Cucumber Integration Tests
+- Outbox publisher behavior and timing
+- Transaction rollback on partial failures
+- Concurrent order operations with same idempotency key
+
+### Unit Tests (Exceptional)
+- OrderStatus and PaymentStatus state transition methods
+- Money and Quantity domain primitive validation
+- Total amount calculation from order items
+- Must justify: "What invariant would break if removed?"
 
 ## Acceptance Criteria
 
